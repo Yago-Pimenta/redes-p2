@@ -2,6 +2,13 @@ import asyncio
 from tcputils import *
 from collections import OrderedDict
 
+def split_into_segments(dados, tamanho_max):
+    segments = []
+    for i in range(0, len(dados), tamanho_max):
+        segmento = dados[i:i+tamanho_max]
+        segments.append(segmento)
+    return segments
+
 
 
 class Servidor:
@@ -63,50 +70,60 @@ class Conexao:
         self.id_conexao = id_conexao
         self.callback = None
         self.seq_no = seq_no
-        self.nex_seq_no = seq_no + 1
+        self.next_seq_no = seq_no + 1
         self.ack_no = seq_no + 1
         self.timer_ativo = False
-        self.nao_confirmado = b""
+        self.unconfirmed_data = b""
+        self.timer_active = False
         self.timer = asyncio.get_event_loop().call_later(1, self._exemplo_timer)
-        self.ack_list = OrderedDict()  # Create an ordered dictionary for acknowledgment numbers
+        self.ack_list = OrderedDict() 
         self.unacked_segments = []
-        self.timer_ativo = False
 
-    # Rest of the class implementation...
 
 
     def _exemplo_timer(self):
         # Esta função é só um exemplo e pode ser removida
         print('Este é um exemplo de como fazer um timer')
 
-    def _rdt_rcv(self, seq_no, ack_no, flags, payload):
-        """
-        Handles the reception of segments from the network layer
-        """
-        #2
-        if seq_no == self.nex_seq_no and (flags & FLAGS_ACK) == FLAGS_ACK:
-            # Segment received in order
-            self.nex_seq_no += len(payload)
-            self.ack_no = seq_no + len(payload)
-            self.callback(self, payload)  # Pass the received data to the application layer
-        elif seq_no < self.nex_seq_no:
-            # Duplicate segment received, retransmit acknowledgment
-            ack_no = self.nex_seq_no
-            header = fix_checksum(make_header(
-                self.id_conexao[3], self.id_conexao[1], self.seq_no, ack_no, FLAGS_ACK),
-                self.id_conexao[2], self.id_conexao[0])
-            self.servidor.rede.enviar(header, self.id_conexao[0])
-        else:
-            # Out-of-order segment received, ignore it for now
-            pass
+    def _rdt_rcv(self, received_seq_no, received_ack_no, received_flags, received_payload):
+        src_addr,    src_port,  dst_addr,   dst_port =  self.id_conexao
 
-        if (flags & FLAGS_ACK) == FLAGS_ACK:
-            ack_segment = fix_checksum(make_header(
-                self.id_conexao[3], self.id_conexao[1], self.seq_no, self.ack_no, FLAGS_ACK),
-                self.id_conexao[2], self.id_conexao[0])
-            self.servidor.rede.enviar(ack_segment, self.id_conexao[0])
+        if received_seq_no != self.ack_no:
+            return
 
-    # Os métodos abaixo fazem parte da API
+        self.ack_no += len(received_payload)
+
+        if (received_flags & FLAGS_FIN) == FLAGS_FIN:
+            self.ack_no +=  1
+            
+            cabecalho = fix_checksum(make_header(dst_port, src_port, received_ack_no, self.ack_no, FLAGS_ACK), dst_addr, src_addr)
+
+            self.servidor.rede.enviar(cabecalho, src_addr)
+
+            print(self.servidor.conexoes)
+
+            del self.servidor.conexoes[self.id_conexao]
+            self.callback(self, b"")
+
+        if (len(received_payload) == 0) and ((received_flags & FLAGS_ACK) == FLAGS_ACK):
+            self.timer.cancel()
+            self.timer_active =  False
+            self.unconfirmed_data =   self.unconfirmed_data[received_ack_no - self.seq_no :]
+            self.seq_no =   received_ack_no
+
+            if received_ack_no < self.next_seq_no:
+                self.timer_active= True
+                self.timer = asyncio.get_event_loop().call_later(1, self._handle_timer)
+
+            return
+
+        self.seq_no =   received_ack_no
+        
+        cabecalho = fix_checksum(make_header(dst_port, src_port, self.seq_no, self.ack_no, FLAGS_ACK), dst_addr, src_addr)
+        self.servidor.rede.enviar(cabecalho, src_addr)
+
+        self.callback(self, received_payload)
+
 
     def registrar_recebedor(self, callback):
         """
@@ -119,21 +136,67 @@ class Conexao:
         """
         Usado pela camada de aplicação para enviar dados
         """
-        #2
-        segmento = fix_checksum(make_header(
-            self.id_conexao[3], self.id_conexao[1], self.seq_no, self.ack_no, FLAGS_ACK) + dados,
-            self.id_conexao[2], self.id_conexao[0])
-        self.servidor.rede.enviar(segmento, self.id_conexao[0])
-        #3
-        payload_segments = split_into_segments(dados, MSS)  
-        for segment in payload_segments:
-            self.unacked_segments.append(segment)
-            self._enviar_segmento(segment)
+        # TODO: implemente aqui o envio de dados.
+        # Chame self.servidor.rede.enviar(segmento, dest_addr) para enviar o segmento
+        # que você construir para a camada de rede.
+        src_addr,   src_port,   dst_addr,   dst_port =  self.id_conexao
+        
+        for i in range(-(-len(dados) // MSS)):
+            
+            payload =   dados[i * MSS: (i + 1) * MSS]
+            cabecalho = make_header(dst_port, src_port, self.next_seq_no, self.ack_no, FLAGS_ACK)
+            segment = fix_checksum(cabecalho + payload, dst_addr, src_addr)
+
+            self.unconfirmed_data +=     payload
+            self.servidor.rede.enviar(segment, src_addr)
+            self.next_seq_no +=     len(payload)
+
+            # If timer not running, start timer
+            if self.timer_active:
+                print("Timer não foi iniciado")
+            else:
+                self.timer_active = True
+                self.timer = asyncio.get_event_loop().call_later(1, self._handle_timer)
+
+
+    def _enviar_segmento(self, segmento):
+        if not self.servidor.rede.fila:  # Verifica se a fila está vazia
+            self.servidor.rede.fila.append((segmento, self.id_conexao[0]))
+
+
+
+
+    def _tratar_segmentos_recebidos(self):
+        while self.unacked_segments and self.unacked_segments[0] in self.ack_list:
+            acked_segment = self.unacked_segments.pop(0)
+            del self.ack_list[acked_segment]
+        self.timer_active = False
+
+    def _enviar_segmento_com_timer(self, segmento):
+        self.unacked_segments.append(segmento)
+        self.ack_list[segmento] = self.seq_no
+        if not self.timer_ativo:
+            self.timer_active= True
+            self.timer = asyncio.get_event_loop().call_later(1, self._tratar_segmentos_recebidos)
+
+    
+    def _handle_timer(self):
+        src_addr,   src_port,   dst_addr,   dst_port =  self.id_conexao
+        cabecalho = fix_checksum(make_header(dst_port, src_port, self.seq_no, self.ack_no, FLAGS_ACK),dst_addr,src_addr)
+        payload =   self.unconfirmed_data[:MSS]
+
+        self.servidor.rede.enviar(cabecalho + payload, src_addr)
+
+        self.timer = asyncio.get_event_loop().call_later(1, self._handle_timer)
 
 
     def fechar(self):
         """
         Usado pela camada de aplicação para fechar a conexão
         """
+        src_addr,   src_port,   dst_addr,   dst_port =  self.id_conexao
+        cabecalho =  fix_checksum(make_header(dst_port, src_port, self.seq_no, self.ack_no, FLAGS_FIN),dst_addr,src_addr)
+        self.servidor.rede.enviar(cabecalho, src_addr)
         if self.id_conexao in self.servidor.conexoes:
             del self.servidor.conexoes[self.id_conexao]
+        
