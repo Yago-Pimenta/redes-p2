@@ -1,6 +1,8 @@
 import asyncio
 from tcputils import *
 from collections import OrderedDict
+import time
+
 
 def split_into_segments(dados, tamanho_max):
     segments = []
@@ -13,10 +15,10 @@ def split_into_segments(dados, tamanho_max):
 
 class Servidor:
     def __init__(self, rede, porta):
-        self.rede = rede
-        self.porta = porta
-        self.conexoes = {}
-        self.callback = None
+        self.rede =     rede
+        self.porta =    porta
+        self.conexoes =     {}
+        self.callback =     None
         self.rede.registrar_recebedor(self._rdt_rcv)
 
     def registrar_monitor_de_conexoes_aceitas(self, callback):
@@ -66,18 +68,18 @@ class Servidor:
 
 class Conexao:
     def __init__(self, servidor, id_conexao, seq_no):
-        self.servidor = servidor
-        self.id_conexao = id_conexao
-        self.callback = None
-        self.seq_no = seq_no
-        self.next_seq_no = seq_no + 1
-        self.ack_no = seq_no + 1
-        self.timer_ativo = False
-        self.unconfirmed_data = b""
-        self.timer_active = False
+        self.servidor =     servidor
+        self.id_conexao =   id_conexao
+        self.callback =     None
+        self.seq_no =   seq_no
+        self.next_seq_no =  seq_no + 1
+        self.ack_no =   seq_no + 1
+        self.timer_ativo =  False
+        self.unconfirmed_data =     b""
+        self.timer_active =     False
         self.timer = asyncio.get_event_loop().call_later(1, self._exemplo_timer)
-        self.ack_list = OrderedDict() 
-        self.unacked_segments = []
+        self.ack_list =     OrderedDict()  
+        self.unacked_segments =     []
 
 
 
@@ -123,8 +125,21 @@ class Conexao:
         self.servidor.rede.enviar(cabecalho, src_addr)
 
         self.callback(self, received_payload)
+        if received_ack_no > self.seq_no:
+            sample_rtt = time.time() - self.ack_list.get(received_ack_no, 0)
+            self.ack_list[received_ack_no] = time.time()
 
+            if not self.EstimatedRTT:
+                self.EstimatedRTT = sample_rtt
+                self.DevRTT = sample_rtt / 2
+            else:
+                self.EstimatedRTT = (1 - 0.125) * self.EstimatedRTT + 0.125 * sample_rtt
+                self.DevRTT = (1 - 0.25) * self.DevRTT + 0.25 * abs(sample_rtt - self.EstimatedRTT)
 
+            # Calcula o TimeoutInterval
+            self.TimeoutInterval = self.EstimatedRTT + 4 * self.DevRTT
+
+        
     def registrar_recebedor(self, callback):
         """
         Usado pela camada de aplicação para registrar uma função para ser chamada
@@ -157,6 +172,10 @@ class Conexao:
             else:
                 self.timer_active = True
                 self.timer = asyncio.get_event_loop().call_later(1, self._handle_timer)
+        if not self.timer_active:
+             self.timer_active = True
+             self.timer = asyncio.get_event_loop().call_later(self.TimeoutInterval, self._handle_timer)
+        self._enviar_segmento_com_timer(segment)
 
 
     def _enviar_segmento(self, segmento):
@@ -188,6 +207,19 @@ class Conexao:
         self.servidor.rede.enviar(cabecalho + payload, src_addr)
 
         self.timer = asyncio.get_event_loop().call_later(1, self._handle_timer)
+
+        unconfirmed_segments = [segment for segment in self.unacked_segments if segment not in self.ack_list]
+
+        # Reenvia os segmentos não confirmados
+        for segment in unconfirmed_segments:
+            self.servidor.rede.enviar(segment, self.id_conexao[0])
+
+        # Reinicia o timer se houver segmentos não confirmados
+        if unconfirmed_segments:
+            self.timer_active = True
+            self.timer = asyncio.get_event_loop().call_later(self.TimeoutInterval, self._handle_timer)
+        else:
+            self.timer_active = False
 
 
     def fechar(self):
